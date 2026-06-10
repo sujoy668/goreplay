@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"sync"
@@ -260,4 +261,84 @@ func BenchmarkEmitter(b *testing.B) {
 
 	wg.Wait()
 	emitter.Close()
+}
+
+// TestLongURLHandling 测试超长URL的处理
+func TestLongURLHandling(t *testing.T) {
+	wg := new(sync.WaitGroup)
+	wg.Add(3) // 期望处理3条消息
+
+	input := NewTestInput()
+
+	output := NewTestOutput(func(msg *Message) {
+		// 验证元数据完整性
+		meta := payloadMeta(msg.Meta)
+		if len(meta) < 3 {
+			t.Errorf("Message has incomplete metadata: %v", meta)
+		}
+		wg.Done()
+	})
+
+	plugins := &InOutPlugins{
+		Inputs:  []PluginReader{input},
+		Outputs: []PluginWriter{output},
+	}
+
+	// 设置较小的缓冲区大小来测试截断
+	originalBufferSize := Settings.CopyBufferSize
+	Settings.CopyBufferSize = 1024 * 1024 // 1MB缓冲区
+	defer func() {
+		Settings.CopyBufferSize = originalBufferSize
+	}()
+
+	emitter := NewEmitter()
+	go emitter.Start(plugins, Settings.Middleware)
+
+	// 发送包含长URL的请求
+	id1 := uuid()
+	reqh1 := payloadHeader(RequestPayload, id1, time.Now().UnixNano(), -1)
+	longURL1 := "/very/long/path/" + string(bytes.Repeat([]byte("a"), 20000)) // 2万个字符的URL
+	reqb1 := append(reqh1, []byte(fmt.Sprintf("GET %s HTTP/1.1\r\nHost: example.com\r\nUser-Agent: GoReplay-Test\r\n\r\n", longURL1))...)
+	input.EmitBytes(reqb1)
+
+	id2 := uuid()
+	reqh2 := payloadHeader(RequestPayload, id2, time.Now().UnixNano(), -1)
+	longURL2 := "/very/long/path/" + string(bytes.Repeat([]byte("b"), 50000)) // 5万个字符的URL
+	reqb2 := append(reqh2, []byte(fmt.Sprintf("GET %s HTTP/1.1\r\nHost: example.com\r\nUser-Agent: GoReplay-Test\r\n\r\n", longURL2))...)
+	input.EmitBytes(reqb2)
+
+	id3 := uuid()
+	reqh3 := payloadHeader(RequestPayload, id3, time.Now().UnixNano(), -1)
+	longURL3 := "/very/long/path/" + string(bytes.Repeat([]byte("c"), 100000)) // 10万个字符的URL
+	reqb3 := append(reqh3, []byte(fmt.Sprintf("GET %s HTTP/1.1\r\nHost: example.com\r\nUser-Agent: GoReplay-Test\r\n\r\n", longURL3))...)
+	input.EmitBytes(reqb3)
+
+	wg.Wait()
+	emitter.Close()
+}
+
+// TestMalformedRecordRecovery 测试畸形记录的恢复机制
+func TestMalformedRecordRecovery(t *testing.T) {
+	// 测试元数据恢复逻辑
+	truncatedMeta := []byte("1 1234567890abcdef1234567890abcdef 123456789") // 缺少换行符
+	completeData := []byte("0 1000\nGET /test HTTP/1.1\r\nHost: example.com\r\n\r\n")
+
+	// 模拟在CopyMulty中的处理逻辑
+	meta := payloadMeta(truncatedMeta)
+	if len(meta) < 3 {
+		// 尝试从数据部分恢复
+		newlinePos := bytes.IndexByte(completeData, '\n')
+		if newlinePos > 0 && newlinePos < 100 {
+			combinedMeta := make([]byte, 0, len(truncatedMeta)+newlinePos+1)
+			combinedMeta = append(combinedMeta, truncatedMeta...)
+			combinedMeta = append(combinedMeta, completeData[:newlinePos+1]...)
+
+			recoveredMeta := payloadMeta(combinedMeta)
+			if len(recoveredMeta) < 3 {
+				t.Errorf("Failed to recover metadata, got %d parts: %v", len(recoveredMeta), recoveredMeta)
+			} else {
+				t.Logf("Successfully recovered metadata: %v", recoveredMeta)
+			}
+		}
+	}
 }

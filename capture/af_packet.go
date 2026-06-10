@@ -1,3 +1,4 @@
+//go:build !linux
 // +build !linux
 
 package capture
@@ -7,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
 )
 
 func newAfpacketHandle(device string, snaplen int, block_size int, num_blocks int,
@@ -14,12 +16,14 @@ func newAfpacketHandle(device string, snaplen int, block_size int, num_blocks in
 	return nil, fmt.Errorf("Not implemented")
 }
 
-func afpacketComputeSize(targetSizeMb int, snaplen int, pageSize int) (
+func afpacketComputeSize(targetSizeMb int, snaplen int, pageSize int, framesPerBlock int) (
 	frameSize int, blockSize int, numBlocks int, err error) {
 	return 0, 0, 0, fmt.Errorf("Not implemented")
 }
 
-type afpacketHandle struct{}
+type afpacketHandle struct {
+	device string
+}
 
 // ReadPacketData satisfies PacketDataSource interface
 func (h *afpacketHandle) ReadPacketData() (data []byte, ci gopacket.CaptureInfo, err error) {
@@ -29,4 +33,15 @@ func (h *afpacketHandle) ReadPacketData() (data []byte, ci gopacket.CaptureInfo,
 // SetBPFFilter translates a BPF filter string into BPF RawInstruction and applies them.
 func (h *afpacketHandle) SetBPFFilter(filter string, snaplen int) (err error) {
 	return fmt.Errorf("Not implemented")
+}
+
+// LinkType returns the appropriate link type based on the device.
+func (h *afpacketHandle) LinkType() layers.LinkType {
+	// For non-Linux systems, just return Ethernet as default
+	return layers.LinkTypeEthernet
+}
+
+// Close will close afpacket source.
+func (h *afpacketHandle) Close() {
+	// No-op for non-Linux systems
 }

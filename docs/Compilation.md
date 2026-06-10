@@ -24,6 +24,8 @@ go get github.com/buger/gor
 # Compile from source
 cd $HOME/gocode/src/github.com/buger/gor
 go build LDFLAGS = -ldflags "-extldflags \"-static\""
+
+// go build -ldflags="-s -w"
 ```
 
 After you finished, you should see `gor` binary in current directory. 

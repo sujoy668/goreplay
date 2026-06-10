@@ -23,6 +23,7 @@ type RAWInputConfig struct {
 	CopyBufferSize  size.Size          `json:"copy-buffer-size"`
 	Engine          capture.EngineType `json:"input-raw-engine"`
 	TrackResponse   bool               `json:"input-raw-track-response"`
+	EnableNewFilter bool               `json:"enable-new-filter"`
 	Protocol        tcp.TCPProtocol    `json:"input-raw-protocol"`
 	RealIPHeader    string             `json:"input-raw-realip-header"`
 	Stats           bool               `json:"input-raw-stats"`
@@ -94,6 +95,11 @@ func (i *RAWInput) PluginRead() (*Message, error) {
 			msg.Data = proto.SetHeader(msg.Data, []byte(i.RealIPHeader), []byte(msgTCP.SrcAddr))
 		}
 	}
+
+	if !i.TrackResponse && msgType == ResponsePayload {
+		return &msg, nil
+	}
+
 	msg.Meta = payloadHeader(msgType, msgTCP.UUID(), msgTCP.Start.UnixNano(), msgTCP.End.UnixNano()-msgTCP.Start.UnixNano())
 
 	// to be removed....
@@ -114,11 +120,15 @@ func (i *RAWInput) PluginRead() (*Message, error) {
 
 func (i *RAWInput) listen(address string) {
 	var err error
-	i.listener, err = capture.NewListener(i.host, i.ports, "", i.Engine, i.Protocol, i.TrackResponse, i.Expire, i.AllowIncomplete)
+
+	outputNic := (len(Settings.OutputTCP) + len(Settings.OutputHTTP)) > 0
+	log.Println("output nic: ", outputNic)
+
+	i.listener, err = capture.NewListener(i.host, i.ports, "", i.Engine, i.Protocol, i.TrackResponse, i.Expire, i.AllowIncomplete, i.EnableNewFilter, outputNic, i.PcapOptions)
 	if err != nil {
 		log.Fatal(err)
 	}
-	i.listener.SetPcapOptions(i.PcapOptions)
+	//i.listener.SetPcapOptions(i.PcapOptions)
 	err = i.listener.Activate()
 	if err != nil {
 		log.Fatal(err)

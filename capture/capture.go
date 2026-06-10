@@ -48,6 +48,13 @@ type PcapOptions struct {
 	Promiscuous   bool          `json:"input-raw-promisc"`
 	Monitor       bool          `json:"input-raw-monitor"`
 	Snaplen       bool          `json:"input-raw-override-snaplen"`
+	// AF_PACKET specific options
+	AFPacketTargetSize size.Size `json:"input-raw-afpacket-target-size"`
+	AFPacketSnaplen    size.Size `json:"input-raw-afpacket-snaplen"`
+	AFPacketFramesPer  int       `json:"input-raw-afpacket-frames-per-block"`
+	EnableVLAN         bool      `json:"input-raw-enable-vlan"`
+	BPFSnaplen         size.Size `json:"input-raw-bpf-snaplen"`
+	FlagLoopBack       bool      `json:"input-raw-flag-loopback"`
 }
 
 // Listener handle traffic capture, this is its representation.
@@ -63,6 +70,8 @@ type Listener struct {
 	Engine          EngineType
 	ports           []uint16 // src or/and dst ports
 	trackResponse   bool
+	enableNewFilter bool
+	outputNic       bool
 	expiry          time.Duration
 	allowIncomplete bool
 	messages        chan *tcp.Message
@@ -126,7 +135,7 @@ func (eng *EngineType) String() (e string) {
 // NewListener creates and initialize a new Listener. if transport or/and engine are invalid/unsupported
 // is "tcp" and "pcap", are assumed. l.Engine and l.Transport can help to get the values used.
 // if there is an error it will be associated with getting network interfaces
-func NewListener(host string, ports []uint16, transport string, engine EngineType, protocol tcp.TCPProtocol, trackResponse bool, expiry time.Duration, allowIncomplete bool) (l *Listener, err error) {
+func NewListener(host string, ports []uint16, transport string, engine EngineType, protocol tcp.TCPProtocol, trackResponse bool, expiry time.Duration, allowIncomplete bool, enableNewFilter bool, outputNic bool, options PcapOptions) (l *Listener, err error) {
 	l = &Listener{}
 
 	l.host = host
@@ -141,6 +150,9 @@ func NewListener(host string, ports []uint16, transport string, engine EngineTyp
 	}
 	l.Handles = make(map[string]packetHandle)
 	l.trackResponse = trackResponse
+	l.enableNewFilter = enableNewFilter
+	l.outputNic = outputNic
+	l.PcapOptions = options
 	l.closeDone = make(chan struct{})
 	l.quit = make(chan struct{})
 	l.Reading = make(chan bool)
@@ -211,6 +223,16 @@ func (l *Listener) ListenBackground(ctx context.Context) chan error {
 func (l *Listener) Filter(ifi pcap.Interface) (filter string) {
 	// https://www.tcpdump.org/manpages/pcap-filter.7.html
 
+	if l.enableNewFilter {
+		filter = l.NewFilter(ifi)
+		return
+	}
+
+	filter = l.CommonFilter(ifi)
+	return
+}
+
+func (l *Listener) CommonFilter(ifi pcap.Interface) (filter string) {
 	hosts := []string{l.host}
 	if listenAll(l.host) || isDevice(l.host, ifi) {
 		hosts = interfaceAddresses(ifi)
@@ -235,6 +257,39 @@ func (l *Listener) Filter(ifi pcap.Interface) (filter string) {
 
 		filter = fmt.Sprintf("%s or %s", filter, responseFilter)
 	}
+
+	return
+}
+
+// Filter returns automatic filter applied by goreplay
+// to a pcap handle of a specific interface
+func (l *Listener) NewFilter(ifi pcap.Interface) (filter string) {
+	// https://www.tcpdump.org/manpages/pcap-filter.7.html
+
+	if l.outputNic {
+		filter = l.CommonFilter(ifi)
+		return
+	}
+
+	filter = tcpPacketFilter("dst", l.ports)
+	filter = fmt.Sprintf("(%s)", filter)
+
+	if l.trackResponse {
+		responseFilter := tcpPacketFilter("src", l.ports)
+		responseFilter = fmt.Sprintf("(%s)", responseFilter)
+
+		filter = fmt.Sprintf("%s or %s", filter, responseFilter)
+	}
+
+	//filter = tcpPacketFilter("dst", l.ports)
+	//filter = fmt.Sprintf("-i %s %s", ifi.Name, filter)
+	//
+	//if l.trackResponse {
+	//	responseFilter := tcpPacketFilter("src", l.ports)
+	//	responseFilter = fmt.Sprintf("-i %s %s", ifi.Name, responseFilter)
+	//
+	//	filter = fmt.Sprintf("%s or %s", filter, responseFilter)
+	//}
 
 	return
 }
@@ -397,10 +452,12 @@ func (l *Listener) read() {
 					return
 				case <-timer.C:
 					if h, ok := hndl.handler.(PcapStatProvider); ok {
-						s, _ := h.Stats()
-						stats.Add("packets_received", int64(s.PacketsReceived))
-						stats.Add("packets_dropped", int64(s.PacketsDropped))
-						stats.Add("packets_if_dropped", int64(s.PacketsIfDropped))
+						s, err := h.Stats()
+						if err == nil {
+							stats.Add("packets_received", int64(s.PacketsReceived))
+							stats.Add("packets_dropped", int64(s.PacketsDropped))
+							stats.Add("packets_if_dropped", int64(s.PacketsIfDropped))
+						}
 					}
 				default:
 					data, ci, err := hndl.handler.ReadPacketData()
@@ -520,6 +577,9 @@ func (l *Listener) activatePcapFile() (err error) {
 		handle.Close()
 		return fmt.Errorf("BPF filter error: %q, filter: %s", e, l.BPFFilter)
 	}
+
+	fmt.Println("BPF Filter:", l.BPFFilter)
+
 	l.Handles["pcap_file"] = packetHandle{
 		handler: handle,
 	}
@@ -527,25 +587,48 @@ func (l *Listener) activatePcapFile() (err error) {
 }
 
 func (l *Listener) activateAFPacket() error {
-	szFrame, szBlock, numBlocks, err := afpacketComputeSize(32, 32<<10, os.Getpagesize())
+	// Get target size from configuration, default to 32MB
+	targetSize := 32
+	if l.AFPacketTargetSize > 0 {
+		targetSize = int(l.AFPacketTargetSize / (1024 * 1024))
+	}
+
+	// Get snaplen from configuration, default to 32KB
+	snaplen := 32 << 10
+	if l.AFPacketSnaplen > 0 {
+		snaplen = int(l.AFPacketSnaplen)
+	}
+
+	// Get frames per block from configuration, default to 128
+	framesPerBlock := l.AFPacketFramesPer
+	if framesPerBlock <= 0 {
+		framesPerBlock = 128
+	}
+
+	szFrame, szBlock, numBlocks, err := afpacketComputeSize(targetSize, snaplen, os.Getpagesize(), framesPerBlock)
 	if err != nil {
 		return err
 	}
 
 	var msg string
 	for _, ifi := range l.Interfaces {
-		handle, err := newAfpacketHandle(ifi.Name, szFrame, szBlock, numBlocks, false, pcap.BlockForever)
+		handle, err := newAfpacketHandle(ifi.Name, szFrame, szBlock, numBlocks, l.EnableVLAN, pcap.BlockForever)
 
 		if err != nil {
 			msg += ("\n" + err.Error())
 			continue
 		}
 
-		if l.BPFFilter == "" {
-			l.BPFFilter = l.Filter(ifi)
+		//if l.BPFFilter == "" {
+		//	l.BPFFilter = l.Filter(ifi)
+		//}
+		ifiFilter := l.Filter(ifi)
+		// Get BPF snaplen from configuration, default to 64KB
+		bpfSnaplen := 64 << 10
+		if l.BPFSnaplen > 0 {
+			bpfSnaplen = int(l.BPFSnaplen)
 		}
-		fmt.Println("Interface:", ifi.Name, ". BPF Filter:", l.BPFFilter)
-		handle.SetBPFFilter(l.BPFFilter, 64<<10)
+		handle.SetBPFFilter(ifiFilter, bpfSnaplen)
 
 		l.Handles[ifi.Name] = packetHandle{
 			handler: handle,
@@ -594,6 +677,10 @@ func (l *Listener) setInterfaces() (err error) {
 
 		if ni.Flags&net.FlagLoopback != 0 {
 			l.loopIndex = ni.Index
+			// Skip loopback interface only if FlagLoopBack is false (default behavior)
+			if !l.PcapOptions.FlagLoopBack {
+				continue
+			}
 		}
 
 		if runtime.GOOS != "windows" {
@@ -662,6 +749,30 @@ func portsFilter(transport string, direction string, ports []uint16) string {
 	var filters []string
 	for _, port := range ports {
 		filters = append(filters, fmt.Sprintf("%s %s port %d", transport, direction, port))
+	}
+	return strings.Join(filters, " or ")
+}
+
+func portsFilterWithoutTransport(direction string, ports []uint16) string {
+	if len(ports) == 0 || ports[0] == 0 {
+		return fmt.Sprintf("%s portrange 0-%d", direction, 1<<16-1)
+	}
+
+	var filters []string
+	for _, port := range ports {
+		filters = append(filters, fmt.Sprintf("%s port %d", direction, port))
+	}
+	return strings.Join(filters, " or ")
+}
+
+func tcpPacketFilter(direction string, ports []uint16) string {
+	if len(ports) == 0 || ports[0] == 0 {
+		return fmt.Sprintf("%s portrange 0-%d", direction, 1<<16-1)
+	}
+
+	var filters []string
+	for _, port := range ports {
+		filters = append(filters, fmt.Sprintf("tcp %s port %d", direction, port))
 	}
 	return strings.Join(filters, " or ")
 }

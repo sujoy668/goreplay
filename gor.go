@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"runtime"
 	"runtime/pprof"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -65,6 +66,47 @@ func loggingMiddleware(addr string, next http.Handler) http.Handler {
 	})
 }
 
+// filterKnownFlags filters out unknown flags to prevent help display
+func filterKnownFlags(args []string) []string {
+	var filteredArgs []string
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+
+		// Skip non-flag arguments
+		if !strings.HasPrefix(arg, "-") {
+			filteredArgs = append(filteredArgs, arg)
+			continue
+		}
+
+		// Handle special flags like --help, -h that should always be passed through
+		flagName := strings.TrimLeft(arg, "-")
+		if flagName == "help" || flagName == "h" {
+			filteredArgs = append(filteredArgs, arg)
+			continue
+		}
+
+		// Handle flags with = (e.g., --flag=value)
+		if idx := strings.Index(arg, "="); idx != -1 {
+			flagName = strings.TrimLeft(arg[:idx], "-")
+		}
+
+		// Check if this flag is defined
+		if flag.CommandLine.Lookup(flagName) != nil {
+			filteredArgs = append(filteredArgs, arg)
+
+			// If flag doesn't contain = and next arg is not a flag, include it as value
+			if !strings.Contains(arg, "=") && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				i++
+				filteredArgs = append(filteredArgs, args[i])
+			}
+		}
+		// Unknown flags are silently ignored
+	}
+
+	return filteredArgs
+}
+
 func main() {
 	if os.Getenv("GOMAXPROCS") == "" {
 		runtime.GOMAXPROCS(runtime.NumCPU() * 2)
@@ -82,8 +124,15 @@ func main() {
 
 		log.Fatal(http.ListenAndServe(args[1], loggingMiddleware(args[1], http.FileServer(http.Dir(dir)))))
 	} else {
-		flag.Parse()
+		// Parse flags but ignore unknown flags instead of showing help
+		flag.CommandLine.Parse(filterKnownFlags(os.Args[1:]))
 		checkSettings()
+
+		// Initialize log file if log directory is specified
+		if err := initLogFile(); err != nil {
+			log.Fatalf("Failed to initialize log file: %v", err)
+		}
+
 		plugins = NewPlugins()
 	}
 
@@ -128,6 +177,10 @@ func main() {
 		exit = 0
 	}
 	emitter.Close()
+
+	// Close log file before exit
+	closeLogFile()
+
 	os.Exit(exit)
 }
 

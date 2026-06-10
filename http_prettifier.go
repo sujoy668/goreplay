@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"fmt"
+	"github.com/andybalholm/brotli"
 	"io/ioutil"
 	"net/http/httputil"
 	"strconv"
@@ -15,8 +16,9 @@ func prettifyHTTP(p []byte) []byte {
 
 	tEnc := bytes.Equal(proto.Header(p, []byte("Transfer-Encoding")), []byte("chunked"))
 	cEnc := bytes.Equal(proto.Header(p, []byte("Content-Encoding")), []byte("gzip"))
+	bEnc := bytes.Equal(proto.Header(p, []byte("Content-Encoding")), []byte("br"))
 
-	if !(tEnc || cEnc) {
+	if !(tEnc || cEnc || bEnc) {
 		return p
 	}
 
@@ -55,6 +57,23 @@ func prettifyHTTP(p []byte) []byte {
 			return p
 		}
 
+		headers = proto.DeleteHeader(headers, []byte("Content-Encoding"))
+
+		newLen := strconv.Itoa(len(content))
+		headers = proto.SetHeader(headers, []byte("Content-Length"), []byte(newLen))
+	}
+
+	if bEnc {
+		buf := bytes.NewReader(content)
+		reader := brotli.NewReader(buf)
+
+		decodeContent, err := ioutil.ReadAll(reader)
+		if err != nil {
+			Debug(1, fmt.Sprintf("[HTTP-PRETTIFIER] %q", err))
+			return p
+		}
+
+		content = decodeContent
 		headers = proto.DeleteHeader(headers, []byte("Content-Encoding"))
 
 		newLen := strconv.Itoa(len(content))

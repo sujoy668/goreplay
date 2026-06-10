@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"github.com/andybalholm/brotli"
 	"strconv"
 	"testing"
 
@@ -25,6 +26,25 @@ func TestHTTPPrettifierGzip(t *testing.T) {
 	if string(newPayload) != "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ntest" {
 		t.Errorf("Payload not match %q", string(newPayload))
 	}
+}
+
+func TestHttpPretifierBrotli(t *testing.T) {
+	bufferString := bytes.NewBufferString("")
+	writer := brotli.NewWriter(bufferString)
+	writer.Write([]byte("test"))
+	writer.Close()
+
+	size := strconv.Itoa(len(bufferString.Bytes()))
+
+	payload := []byte("HTTP/1.1 200 OK\r\nContent-Length: " + size + "\r\nContent-Encoding: br\r\n\r\n")
+	payload = append(payload, bufferString.Bytes()...)
+
+	decodePayload := prettifyHTTP(payload)
+
+	if string(decodePayload) != "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ntest" {
+		t.Errorf("Payload not match %q", string(decodePayload))
+	}
+
 }
 
 func TestHTTPPrettifierChunked(t *testing.T) {

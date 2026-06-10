@@ -19,14 +19,13 @@ type HTTPModifierConfig struct {
 	HeaderBasicAuthFilters HTTPHeaderBasicAuthFilters `json:"http-basic-auth-filter"`
 	HeaderHashFilters      HTTPHashFilters            `json:"http-header-limiter"`
 	ParamHashFilters       HTTPHashFilters            `json:"http-param-limiter"`
+	ParamFilters           HTTPParamFilters           `json:"http-allow-param"`
 	Params                 HTTPParams                 `json:"http-set-param"`
 	Headers                HTTPHeaders                `json:"http-set-header"`
 	Methods                HTTPMethods                `json:"http-allow-method"`
 }
 
-//
 // Handling of --http-allow-header, --http-disallow-header options
-//
 type headerFilter struct {
 	name   []byte
 	regexp *regexp.Regexp
@@ -56,9 +55,7 @@ func (h *HTTPHeaderFilters) Set(value string) error {
 	return nil
 }
 
-//
 // Handling of --http-basic-auth-filter option
-//
 type basicAuthFilter struct {
 	regexp *regexp.Regexp
 }
@@ -82,9 +79,7 @@ func (h *HTTPHeaderBasicAuthFilters) Set(value string) error {
 	return nil
 }
 
-//
 // Handling of --http-allow-header-hash and --http-allow-param-hash options
-//
 type hashFilter struct {
 	name    []byte
 	percent uint32
@@ -129,9 +124,7 @@ func (h *HTTPHashFilters) Set(value string) error {
 	return nil
 }
 
-//
 // Handling of --http-set-header option
-//
 type httpHeader struct {
 	Name  string
 	Value string
@@ -160,9 +153,7 @@ func (h *HTTPHeaders) Set(value string) error {
 	return nil
 }
 
-//
 // Handling of --http-set-param option
-//
 type httpParam struct {
 	Name  []byte
 	Value []byte
@@ -208,9 +199,52 @@ func (h *HTTPMethods) Set(value string) error {
 	return nil
 }
 
-//
+// Handling of --http-allow-param option
+type paramFilter struct {
+	name   []byte
+	value  []byte
+	regexp *regexp.Regexp
+}
+
+// HTTPParamFilters holds list of parameter filters
+type HTTPParamFilters []paramFilter
+
+func (h *HTTPParamFilters) String() string {
+	return fmt.Sprint(*h)
+}
+
+// Set method to implement flags.Value
+func (h *HTTPParamFilters) Set(value string) error {
+	valArr := strings.SplitN(value, "=", 2)
+	if len(valArr) < 1 || strings.TrimSpace(valArr[0]) == "" {
+		return errors.New("need parameter name (ex. user_id=123, user_id=^[0-9]+$ for regex, or user_id for key-only match)")
+	}
+
+	filter := paramFilter{
+		name: []byte(strings.TrimSpace(valArr[0])),
+	}
+
+	// If there's a value part, set it and compile as regex
+	if len(valArr) == 2 {
+		val := strings.TrimSpace(valArr[1])
+		filter.value = []byte(val)
+
+		// Try to compile as regex
+		if val != "" {
+			r, err := regexp.Compile(val)
+			if err != nil {
+				return fmt.Errorf("invalid regex pattern '%s': %v", val, err)
+			}
+			filter.regexp = r
+		}
+	}
+
+	*h = append(*h, filter)
+
+	return nil
+}
+
 // Handling of --http-rewrite-url option
-//
 type urlRewrite struct {
 	src    *regexp.Regexp
 	target []byte
@@ -237,9 +271,7 @@ func (r *URLRewriteMap) Set(value string) error {
 	return nil
 }
 
-//
 // Handling of --http-rewrite-header option
-//
 type headerRewrite struct {
 	header []byte
 	src    *regexp.Regexp
@@ -275,9 +307,7 @@ func (r *HeaderRewriteMap) Set(value string) error {
 	return nil
 }
 
-//
 // Handling of --http-allow-url option
-//
 type urlRegexp struct {
 	regexp *regexp.Regexp
 }
@@ -292,8 +322,13 @@ func (r *HTTPURLRegexp) String() string {
 // Set method to implement flags.Value
 func (r *HTTPURLRegexp) Set(value string) error {
 	regexp, err := regexp.Compile(value)
+	if err != nil {
+		Debug(1, "[URLRegexp] Failed to compile regexp:", value, "error:", err)
+		return err
+	}
 
 	*r = append(*r, urlRegexp{regexp: regexp})
+	Debug(2, "[URLRegexp] Successfully compiled and added regexp:", value)
 
-	return err
+	return nil
 }

@@ -8,6 +8,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/buger/goreplay/proto"
+
 	"github.com/buger/goreplay/byteutils"
 )
 
@@ -76,7 +78,8 @@ func (e *Emitter) Close() {
 func CopyMulty(src PluginReader, writers ...PluginWriter) error {
 	wIndex := 0
 	modifier := NewHTTPModifier(&Settings.ModifierConfig)
-	filteredRequests := make(map[string]int64)
+	// filteredRequests := make(map[string]int64)
+	allowedRequests := make(map[string]int64)
 	filteredRequestsLastCleanTime := time.Now().UnixNano()
 	filteredCount := 0
 
@@ -102,25 +105,38 @@ func CopyMulty(src PluginReader, writers ...PluginWriter) error {
 			if Settings.Verbose >= 3 {
 				Debug(3, "[EMITTER] input: ", byteutils.SliceToString(msg.Meta[:len(msg.Meta)-1]), " from: ", src)
 			}
-			if modifier != nil {
-				Debug(3, "[EMITTER] modifier:", requestID, "from:", src)
-				if isRequestPayload(msg.Meta) {
+			if isRequestPayload(msg.Meta) {
+				if !proto.HasRequestTitle(msg.Data) {
+					continue
+				}
+
+				// Handle request processing
+				if modifier != nil {
+					Debug(3, "[EMITTER] modifier:", requestID, "from:", src)
 					msg.Data = modifier.Rewrite(msg.Data)
 					// If modifier tells to skip request
 					if len(msg.Data) == 0 {
-						filteredRequests[requestID] = time.Now().UnixNano()
-						filteredCount++
 						continue
 					}
 					Debug(3, "[EMITTER] Rewritten input:", requestID, "from:", src)
-
-				} else {
-					if _, ok := filteredRequests[requestID]; ok {
-						delete(filteredRequests, requestID)
-						filteredCount--
-						continue
-					}
 				}
+				// Request passed all filters, mark it as allowed only if trackResponse is enabled
+				if Settings.TrackResponse {
+					allowedRequests[requestID] = time.Now().UnixNano()
+					filteredCount++
+				}
+			} else {
+				if !Settings.TrackResponse {
+					continue
+				}
+
+				// For responses, check if corresponding request was allowed
+				if _, ok := allowedRequests[requestID]; !ok {
+					// Response for unallowed request, skip it
+					continue
+				}
+				// Clean up the allowed request entry
+				delete(allowedRequests, requestID)
 			}
 
 			if Settings.PrettifyHTTP {
@@ -164,10 +180,10 @@ func CopyMulty(src PluginReader, writers ...PluginWriter) error {
 			// Clean up filtered requests for which we didn't get a response to filter
 			now := time.Now().UnixNano()
 			if now-filteredRequestsLastCleanTime > int64(60*time.Second) {
-				for k, v := range filteredRequests {
+				// Also clean up old allowed requests that didn't get responses
+				for k, v := range allowedRequests {
 					if now-v > int64(60*time.Second) {
-						delete(filteredRequests, k)
-						filteredCount--
+						delete(allowedRequests, k)
 					}
 				}
 				filteredRequestsLastCleanTime = time.Now().UnixNano()

@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 package capture
@@ -17,12 +18,13 @@ import (
 
 type afpacketHandle struct {
 	TPacket *afpacket.TPacket
+	device  string
 }
 
 func newAfpacketHandle(device string, snaplen int, block_size int, num_blocks int,
 	useVLAN bool, timeout time.Duration) (*afpacketHandle, error) {
 
-	h := &afpacketHandle{}
+	h := &afpacketHandle{device: device}
 	var err error
 
 	if device == "any" {
@@ -30,7 +32,7 @@ func newAfpacketHandle(device string, snaplen int, block_size int, num_blocks in
 			afpacket.OptFrameSize(snaplen),
 			afpacket.OptBlockSize(block_size),
 			afpacket.OptNumBlocks(num_blocks),
-			afpacket.OptAddVLANHeader(false),
+			afpacket.OptAddVLANHeader(useVLAN),
 			afpacket.OptPollTimeout(timeout),
 			afpacket.SocketRaw,
 			afpacket.TPacketVersion3)
@@ -40,7 +42,7 @@ func newAfpacketHandle(device string, snaplen int, block_size int, num_blocks in
 			afpacket.OptFrameSize(snaplen),
 			afpacket.OptBlockSize(block_size),
 			afpacket.OptNumBlocks(num_blocks),
-			afpacket.OptAddVLANHeader(false),
+			afpacket.OptAddVLANHeader(useVLAN),
 			afpacket.OptPollTimeout(timeout),
 			afpacket.SocketRaw,
 			afpacket.TPacketVersion3)
@@ -55,29 +57,36 @@ func (h *afpacketHandle) ReadPacketData() (data []byte, ci gopacket.CaptureInfo,
 
 // SetBPFFilter translates a BPF filter string into BPF RawInstruction and applies them.
 func (h *afpacketHandle) SetBPFFilter(filter string, snaplen int) (err error) {
-	pcapBPF, err := pcap.CompileBPFFilter(layers.LinkTypeEthernet, snaplen, filter)
+	linkType := h.LinkType()
+
+	fmt.Println("Interface:", h.device, ". BPF Filter:", filter, "Link Type: ", linkType)
+	pcapBPF, err := pcap.CompileBPFFilter(linkType, snaplen, filter)
 	if err != nil {
 		return err
 	}
-	bpfIns := []bpf.RawInstruction{}
-	for _, ins := range pcapBPF {
-		bpfIns2 := bpf.RawInstruction{
+	bpfIns := make([]bpf.RawInstruction, len(pcapBPF))
+	for i, ins := range pcapBPF {
+		bpfIns[i] = bpf.RawInstruction{
 			Op: ins.Code,
 			Jt: ins.Jt,
 			Jf: ins.Jf,
 			K:  ins.K,
 		}
-		bpfIns = append(bpfIns, bpfIns2)
-	}
-	if h.TPacket.SetBPF(bpfIns); err != nil {
-		return err
 	}
 	return h.TPacket.SetBPF(bpfIns)
 }
 
-// LinkType returns ethernet link type.
+// LinkType returns the appropriate link type based on the device.
 func (h *afpacketHandle) LinkType() layers.LinkType {
-	return layers.LinkTypeEthernet
+	// Handle special device names
+	switch h.device {
+	case "any":
+		// For "any" device, use Linux SLL (Socket Link Layer)
+		return layers.LinkTypeLinuxSLL
+	default:
+		// Default to Ethernet for most network interfaces
+		return layers.LinkTypeEthernet
+	}
 }
 
 // Close will close afpacket source.
@@ -94,7 +103,7 @@ func (h *afpacketHandle) SocketStats() (as afpacket.SocketStats, asv afpacket.So
 // allocated mmap buffer is close to but smaller than target_size_mb.
 // The restriction is that the block_size must be divisible by both the
 // frame size and page size.
-func afpacketComputeSize(targetSizeMb int, snaplen int, pageSize int) (
+func afpacketComputeSize(targetSizeMb int, snaplen int, pageSize int, framesPerBlock int) (
 	frameSize int, blockSize int, numBlocks int, err error) {
 
 	if snaplen < pageSize {
@@ -103,8 +112,11 @@ func afpacketComputeSize(targetSizeMb int, snaplen int, pageSize int) (
 		frameSize = (snaplen/pageSize + 1) * pageSize
 	}
 
-	// 128 is the default from the gopacket library so just use that
-	blockSize = frameSize * 128
+	// Use configurable frames per block, fallback to 128 if invalid
+	if framesPerBlock <= 0 {
+		framesPerBlock = 128
+	}
+	blockSize = frameSize * framesPerBlock
 	numBlocks = (targetSizeMb * 1024 * 1024) / blockSize
 
 	if numBlocks == 0 {

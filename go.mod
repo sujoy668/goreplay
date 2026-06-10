@@ -4,6 +4,7 @@ go 1.15
 
 require (
 	github.com/Shopify/sarama v1.26.4
+	github.com/andybalholm/brotli v1.1.0
 	github.com/araddon/gou v0.0.0-20190110011759-c797efecbb61 // indirect
 	github.com/aws/aws-sdk-go v1.33.2
 	github.com/bitly/go-hostpool v0.1.0 // indirect

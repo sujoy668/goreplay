@@ -3,7 +3,12 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
+	"log"
+	"net"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -29,6 +34,7 @@ type AppSettings struct {
 	Verbose   int           `json:"verbose"`
 	Stats     bool          `json:"stats"`
 	ExitAfter time.Duration `json:"exit-after"`
+	LogDir    string        `json:"log-dir"`
 
 	SplitOutput          bool   `json:"split-output"`
 	RecognizeTCPSessions bool   `json:"recognize-tcp-sessions"`
@@ -69,6 +75,9 @@ type AppSettings struct {
 
 	ModifierConfig HTTPModifierConfig
 
+	// Auto BPF (payload>0) toggle
+	EnableAutoBPFFilter bool `json:"enable-bpf-filter"`
+
 	InputKafkaConfig  InputKafkaConfig
 	OutputKafkaConfig OutputKafkaConfig
 	KafkaTLSConfig    KafkaTLSConfig
@@ -87,6 +96,7 @@ func init() {
 	flag.Usage = usage
 	flag.StringVar(&Settings.Pprof, "http-pprof", "", "Enable profiling. Starts  http server on specified port, exposing special /debug/pprof endpoint. Example: `:8181`")
 	flag.IntVar(&Settings.Verbose, "verbose", 0, "set the level of verbosity, if greater than zero then it will turn on debug output")
+	flag.StringVar(&Settings.LogDir, "log-dir", "", "Path to log file for debug output. If empty, logs will be written to stderr")
 	flag.BoolVar(&Settings.Stats, "stats", false, "Turn on queue stats output")
 
 	if DEMO == "" {
@@ -134,11 +144,13 @@ func init() {
 	// input raw flags
 	flag.Var(&Settings.InputRAW, "input-raw", "Capture traffic from given port (use RAW sockets and require *sudo* access):\n\t# Capture traffic from 8080 port\n\tgor --input-raw :8080 --output-http staging.com")
 	flag.BoolVar(&Settings.TrackResponse, "input-raw-track-response", false, "If turned on Gor will track responses in addition to requests, and they will be available to middleware and file output.")
+	//flag.IntVar(&Settings.RAWInputConfig.RequestTrackerSize, "input-raw-track-size", 5000, "Maximum number of requests to track. Higher values use more memory but support more concurrent requests.")
 	flag.Var(&Settings.Engine, "input-raw-engine", "Intercept traffic using `libpcap` (default), `raw_socket` or `pcap_file`")
 	flag.Var(&Settings.Protocol, "input-raw-protocol", "Specify application protocol of intercepted traffic. Possible values: http, binary")
 	flag.StringVar(&Settings.RealIPHeader, "input-raw-realip-header", "", "If not blank, injects header with given name and real IP value to the request payload. Usually this header should be named: X-Real-IP")
 	flag.DurationVar(&Settings.Expire, "input-raw-expire", time.Second*2, "How much it should wait for the last TCP packet, till consider that TCP message complete.")
 	flag.StringVar(&Settings.BPFFilter, "input-raw-bpf-filter", "", "BPF filter to write custom expressions. Can be useful in case of non standard network interfaces like tunneling or SPAN port. Example: --input-raw-bpf-filter 'dst port 80'")
+	flag.BoolVar(&Settings.EnableAutoBPFFilter, "enable-bpf-filter", false, "Enable built-in payload>0 BPF when no custom --input-raw-bpf-filter is provided. Port is taken from --input-raw.")
 	flag.StringVar(&Settings.TimestampType, "input-raw-timestamp-type", "", "Possible values: PCAP_TSTAMP_HOST, PCAP_TSTAMP_HOST_LOWPREC, PCAP_TSTAMP_HOST_HIPREC, PCAP_TSTAMP_ADAPTER, PCAP_TSTAMP_ADAPTER_UNSYNCED. This values not supported on all systems, GoReplay will tell you available values of you put wrong one.")
 	flag.Var(&Settings.CopyBufferSize, "copy-buffer-size", "Set the buffer size for an individual request (default 5MB)")
 	flag.BoolVar(&Settings.Snaplen, "input-raw-override-snaplen", false, "Override the capture snaplen to be 64k. Required for some Virtualized environments")
@@ -148,6 +160,15 @@ func init() {
 	flag.BoolVar(&Settings.Monitor, "input-raw-monitor", false, "enable RF monitor mode")
 	flag.BoolVar(&Settings.Stats, "input-raw-stats", false, "enable stats generator on raw TCP messages")
 	flag.BoolVar(&Settings.AllowIncomplete, "input-raw-allow-incomplete", false, "If turned on Gor will record HTTP messages with missing packets")
+	flag.BoolVar(&Settings.EnableNewFilter, "enable-new-filter", false, "Customize logic that determine to use new filter or not")
+
+	// AF_PACKET specific flags
+	flag.Var(&Settings.AFPacketTargetSize, "input-raw-afpacket-target-size", "AF_PACKET ring buffer target size (default: 32MB)")
+	flag.Var(&Settings.AFPacketSnaplen, "input-raw-afpacket-snaplen", "AF_PACKET snaplen for packet capture (default: 32KB)")
+	flag.IntVar(&Settings.AFPacketFramesPer, "input-raw-afpacket-frames-per-block", 128, "Number of frames per block in AF_PACKET ring buffer (default: 128)")
+	flag.BoolVar(&Settings.EnableVLAN, "input-raw-enable-vlan", false, "Enable VLAN header processing in AF_PACKET mode")
+	flag.Var(&Settings.BPFSnaplen, "input-raw-bpf-snaplen", "BPF filter snaplen (default: 64KB)")
+	flag.BoolVar(&Settings.RAWInputConfig.FlagLoopBack, "input-raw-flag-loopback", true, "Enable loopback interface capture. By default, loopback interfaces are enabled. Set this flag to false to capture from nic interfaces only.")
 
 	flag.StringVar(&Settings.Middleware, "middleware", "", "Used for modifying traffic using external command")
 
@@ -206,15 +227,75 @@ func init() {
 	flag.Var(&Settings.ModifierConfig.HeaderBasicAuthFilters, "http-basic-auth-filter", "A regexp to match the decoded basic auth string against. Requests with non-matching headers will be dropped:\n\t gor --input-raw :8080 --output-http staging.com --http-basic-auth-filter \"^customer[0-9].*\"")
 	flag.Var(&Settings.ModifierConfig.HeaderHashFilters, "http-header-limiter", "Takes a fraction of requests, consistently taking or rejecting a request based on the FNV32-1A hash of a specific header:\n\t gor --input-raw :8080 --output-http staging.com --http-header-limiter user-id:25%")
 	flag.Var(&Settings.ModifierConfig.ParamHashFilters, "http-param-limiter", "Takes a fraction of requests, consistently taking or rejecting a request based on the FNV32-1A hash of a specific GET param:\n\t gor --input-raw :8080 --output-http staging.com --http-param-limiter user_id:25%")
+	flag.Var(&Settings.ModifierConfig.ParamFilters, "http-allow-param", "Filter requests by GET param key=value. Supports regex patterns for values. Only requests with matching param values will be forwarded:\n\t gor --input-raw :8080 --output-http staging.com --http-allow-param user_id=123\n\t gor --input-raw :8080 --output-http staging.com --http-allow-param user_id=^[0-9]+$\n\t gor --input-raw :8080 --output-http staging.com --http-allow-param debug")
 
 	// default values, using for tests
 	Settings.OutputFileConfig.SizeLimit = 33554432
 	Settings.OutputFileConfig.OutputFileMaxSize = 1099511627776
 	Settings.CopyBufferSize = 5242880
+}
 
+func applyAutoBPFFilter() {
+	// Only apply when user did not provide custom filter and explicitly enabled
+	if Settings.BPFFilter != "" || !Settings.EnableAutoBPFFilter {
+		return
+	}
+
+	// Collect ports from --input-raw options (support comma-separated port list, strip limiter "|")
+	var ports []string
+	for _, rawOpt := range Settings.InputRAW {
+		addr := rawOpt
+		if pipe := strings.Index(rawOpt, "|"); pipe != -1 {
+			addr = rawOpt[:pipe]
+		}
+		_, portPart, err := net.SplitHostPort(addr)
+		if err != nil || portPart == "" {
+			continue
+		}
+		for _, p := range strings.Split(portPart, ",") {
+			if sp := strings.TrimSpace(p); sp != "" {
+				ports = append(ports, sp)
+			}
+		}
+	}
+
+	if len(ports) == 0 {
+		return
+	}
+
+	// Build port expression.
+	// When TrackResponse is enabled, we need to capture both directions:
+	//   - inbound requests:  tcp dst port <port>
+	//   - outbound responses: tcp src port <port>
+	// Otherwise only capture inbound requests (dst port).
+	var portExpr string
+	if Settings.TrackResponse {
+		// Capture both request and response packets for each port
+		clauses := make([]string, 0, len(ports)*2)
+		for _, p := range ports {
+			clauses = append(clauses, "tcp dst port "+p, "tcp src port "+p)
+		}
+		portExpr = strings.Join(clauses, " or ")
+	} else if len(ports) == 1 {
+		portExpr = "tcp dst port " + ports[0]
+	} else {
+		clauses := make([]string, 0, len(ports))
+		for _, p := range ports {
+			clauses = append(clauses, "tcp dst port "+p)
+		}
+		portExpr = strings.Join(clauses, " or ")
+	}
+
+	const payloadGTZero = "(((ip[2:2]-((ip[0]&0xf)<<2))-((tcp[12]&0xf0)>>2))!=0)"
+	Settings.BPFFilter = fmt.Sprintf("%s and %s", portExpr, payloadGTZero)
 }
 
 func checkSettings() {
+	// Apply auto BPF after flags parsed and inputs populated
+	applyAutoBPFFilter()
+	if Settings.BPFFilter != "" || Settings.EnableAutoBPFFilter {
+		Debug(1, "[INPUT-RAW] auto BPF applied:", Settings.BPFFilter)
+	}
 	if Settings.OutputFileConfig.SizeLimit < 1 {
 		Settings.OutputFileConfig.SizeLimit.Set("32mb")
 	}
@@ -228,6 +309,43 @@ func checkSettings() {
 
 var previousDebugTime = time.Now()
 var debugMutex sync.Mutex
+var logFile *os.File
+var logWriter io.Writer = os.Stderr
+
+// initLogFile initializes log file if log file path is specified
+func initLogFile() error {
+	if Settings.LogDir == "" {
+		return nil
+	}
+
+	// Create parent directory if it doesn't exist
+	dir := filepath.Dir(Settings.LogDir)
+	if dir != "." && dir != "/" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("failed to create log directory: %v", err)
+		}
+	}
+
+	// Open/create the log file
+	file, err := os.OpenFile(Settings.LogDir, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to create log file: %v", err)
+	}
+
+	logFile = file
+	logWriter = file
+	log.Printf("Log file initialized: %s", Settings.LogDir)
+	return nil
+}
+
+// closeLogFile closes the log file if it's open
+func closeLogFile() {
+	if logFile != nil {
+		logFile.Close()
+		logFile = nil
+		logWriter = os.Stderr
+	}
+}
 
 // Debug take an effect only if --verbose greater than 0 is specified
 func Debug(level int, args ...interface{}) {
@@ -237,7 +355,8 @@ func Debug(level int, args ...interface{}) {
 		now := time.Now()
 		diff := now.Sub(previousDebugTime)
 		previousDebugTime = now
-		fmt.Fprintf(os.Stderr, "[DEBUG][elapsed %s]: ", diff)
-		fmt.Fprintln(os.Stderr, args...)
+		timestamp := now.Format("2006-01-02 15:04:05.000")
+		fmt.Fprintf(logWriter, "[%s][DEBUG][elapsed %s]: ", timestamp, diff)
+		fmt.Fprintln(logWriter, args...)
 	}
 }
